@@ -1,1 +1,2 @@
-# SLES 15 on BF-2
+# SLES 15 arm on BF-2
+
