@@ -6,11 +6,10 @@ ADD create_bfb .
 ADD install.sh .
 ADD bootimages bootimages/
 ADD qemu-aarch64-static /usr/bin/
-
+ADD http://192.168.150.160/repo/rmt-server.crt /etc/pki/trust/anchors/rmt.crt
 #RUN zypper ref
 
 RUN zypper -n in SUSEConnect
-RUN SUSEConnect --regcode INTERNAL-USE-ONLY-d7b2-6663
 
 RUN zypper ref
 RUN zypper up
