@@ -7,7 +7,7 @@ ADD install.sh .
 ADD bootimages bootimages/
 ADD qemu-aarch64-static /usr/bin/
 ADD http://192.168.150.160/repo/rmt-server.crt /etc/pki/trust/anchors/rmt.crt
-#RUN zypper ref
+#add your local RMT server
 
 RUN zypper -n in SUSEConnect
 
