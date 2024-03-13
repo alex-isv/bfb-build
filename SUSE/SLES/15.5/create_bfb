@@ -1,0 +1,256 @@
+#!/bin/bash -x
+
+set -e
+
+LANG=C
+BF_HOSTNAME="localhost"
+SDIR="/root/workspace"
+BFB="${BFB:-/lib/firmware/mellanox/boot/default.bfb}"
+CAPSULE="${CAPSULE:-/lib/firmware/mellanox/boot/capsule/boot_update2.cap}"
+verbose=0
+
+#kdir=$(/bin/ls -1d /lib/modules/5.* 2> /dev/null | head -1)
+#if [ -n "$kdir" ]; then
+#	kernel=${kdir##*/}
+#else
+#	kernel=$(/bin/ls -1 /lib/modules/ | head -1)
+#fi
+
+kdir=$(/bin/ls -1d /lib/modules/*)
+for i in $kdir
+do
+  if [ -e $i/modules.dep ]; then
+#    echo $i/modules
+    kernel=${kdir##*/}
+    echo $kernel
+  fi
+done
+
+SCRIPTS_DIR=`dirname $0`
+
+WDIR=${WDIR:-/root/workspace/bfb}
+
+echo "Work directory: $WDIR"
+
+SLES_BFB=sles.bfb
+
+echo ${BF_HOSTNAME} > /etc/hostname
+#hostname ${BF_HOSTNAME}
+
+mkdir -p /workspace
+
+/bin/rm -rf ${WDIR}
+mkdir -p ${WDIR}
+cd ${WDIR}
+/bin/rm -rf initramfs
+
+#initramfs=/boot/initrd-${kernel}
+initramfs=$WDIR/dump-initramfs-v0
+
+DRACUT_KMODDIR_OVERRIDE=1 dracut --force --no-hostonly -m 'bash network base shutdown' --force-drivers 'mlxbf-bootctl mlxbf_tmfifo dw_mmc-bluefield mlxbf_gige gpio-mlxbf gpio-mlxbf2 i2c-mlxbf mlxbf-pmc mmc_block mlx5_core mlx5_ib ib_umad nvme nvme-tcp nvme-rdma nvme-fc nvme-fabrics nvme-core ext4 virtio_blk virtio_balloon virtio_scsi vfat msdos fat exfat nls_cp437 nls_cp850 nls_iso8859-1 efivarfs' --filesystems "ext4 xfs vfat btrfs" -k /lib/modules/${kernel}/ --gzip $initramfs ${kernel}
+ls -lah /boot
+
+cat > /etc/default/grub << EOF
+GRUB_TIMEOUT=5
+GRUB_RECORDFAIL_TIMEOUT=2
+GRUB_DEFAULT=saved
+GRUB_DISABLE_SUBMENU=true
+GRUB_TERMINAL=console
+GRUB_SERIAL_COMMAND="serial --unit=1"
+GRUB_CMDLINE_LINUX="crashkernel=auto console=hvc0 console=ttyAMA0 earlycon=pl011,0x01000000 modprobe.blacklist=mlx5_core,mlx5_ib net.ifnames=0 biosdevname=0"
+GRUB_DISABLE_RECOVERY="true"
+GRUB_TIMEOUT_STYLE=countdown
+GRUB_DISABLE_OS_PROBER=false
+EOF
+
+
+case "$(file --brief --mime-type "$initramfs")" in
+	"application/x-lzma")
+		cat_initrd="lzcat" ;;
+	"application/x-lz4")
+		cat_initrd="lz4cat" ;;
+	*)
+		cat_initrd="zcat" ;;
+esac
+
+echo "Rebuilding $initramfs"
+
+mkdir -p ${WDIR}/initramfs
+cd initramfs
+$cat_initrd "$initramfs" | cpio -i
+
+
+copy_bin()
+{
+	if [ -e $1 ]; then
+		bin=$1
+	else
+		bin=`which $1 2> /dev/null`
+	fi
+	if [ -z "$bin" ]; then
+		echo "ERROR: Cannot find $1"
+		return 1
+	fi
+	
+	mkdir -p .`dirname $bin`
+	if [ -e .${bin} ]; then
+		/bin/rm -f .${bin}
+	fi
+	cp -a $bin .${bin}
+
+	# Copy dependencies
+	for lib in `ldd $bin 2> /dev/null | grep '=>' | awk '{print $3}' | grep -v '(0x0'`
+	do
+		if [ -e .$lib ]; then
+			continue
+		fi
+		mkdir -p .`dirname $lib`
+		cp -a $lib .$lib
+		if [ -h $lib ]; then
+			tlib=`readlink -f $lib`
+			if [ ! -e .$tlib ]; then
+				mkdir -p .`dirname $tlib`
+				cp $tlib .$tlib
+			fi
+		fi
+	done
+}
+
+copy_rpm()
+{
+	package=$1
+
+	if ! (rpm -q $package); then
+		yum install -y $package || return
+	fi
+
+	case $package in
+		chkconfig)
+			for f in `rpm -ql $package | grep -v share`
+			do
+				if [ -d $f ]; then
+					mkdir -p .${f}
+				else
+					copy_bin $f
+				fi
+			done
+			;;
+		*mft*)
+			for f in `rpm -ql $package | grep -v man`
+			do
+				if [ -d $f ]; then
+					continue
+				fi
+				copy_bin $f
+			done
+			;;
+		*)
+			for f in `rpm -ql $package | grep -vE 'share|build-id'`
+			do
+				if [ -d $f ]; then
+					continue
+				fi
+				copy_bin $f
+			done
+			;;
+	esac
+}
+
+# Copy the content of RPM packages
+for package in openssh util-linux dosfstools e2fsprogs btrfsprogs kmod pciutils usbutils chkconfig tar xfsprogs coreutils parted which curl openssl grub2
+do
+	copy_rpm $package || true
+done
+
+# Copy tools
+for tool in passwd chpasswd find xz efibootmgr bash getopt hexdump lspci perl lsblk blkid systemctl strings id grep
+do
+	if [ -d $tool ]; then
+		continue
+	fi
+	copy_bin $tool || true
+done
+
+depmod -a -b ./ $kernel
+ldconfig -r ./
+mkdir -p usr/share/hwdata/ bin/
+cp /usr/share/hwdata/pci.ids ./usr/share/hwdata/
+mkdir -p ./lib/firmware/mellanox/boot/
+cp /lib/firmware/mellanox/boot/default.bfb ./lib/firmware/mellanox/boot/default.bfb
+cp -a /lib/firmware/mellanox/boot/capsule ./lib/firmware/mellanox/boot/
+cp $CAPSULE ./lib/firmware/mellanox/boot/capsule/
+mkdir -p mnt
+
+mkdir -p tumbleweed
+
+# Tar the image
+XZ_OPT="--threads=0 -9 --verbose" tar -cJp --exclude='./workspace' --exclude='./signing-local' --exclude='./signing-shared' --exclude='./var/run/docker.sock' --exclude='./root/workspace' --exclude='./tmp/*' --exclude='./run/*' --exclude='./sys/*' --exclude='./proc/*' --exclude='./dev/*' --exclude='./.dockerenv' --exclude='./root/rpmbuild' --exclude='./root/.rpmmacros' --exclude='./root/.bash_history' --exclude='./var/tmp/*rpm' --exclude='./bin/qemu-aarch64-static' --exclude='./usr/bin/qemu-aarch64-static' --exclude='./usr/bin/qemu-arm-static' --exclude='./var/lib/yum/*' --exclude='./var/cache/yum/*' -f ./tumbleweed/image.tar.xz -C / .
+
+install -m 0755 ${SDIR}/install.sh ./tumbleweed/install.sh
+
+mkdir scripts
+
+cat > scripts/install-tumbleweed.sh << EOF
+#!/bin/sh
+
+echo
+echo "=====================================" | tee /dev/kmsg
+echo "Installing Tumbleweed. Please wait..." | tee /dev/kmsg
+echo "=====================================" | tee /dev/kmsg
+
+modprobe -a mlxbf_tmfifo dw_mmc_bluefield mmc_block virtio_console mlxbf_bootctl 2>&1 | tee /dev/kmsg
+#modprobe -a mlx5_ib ib_uverbs 2>&1 | tee /dev/kmsg
+
+# for qemu test
+#modprobe -a virtio_scsi virtio_blk efivarfs
+
+sleep 5
+
+/bin/sh /tumbleweed/install.sh
+if [ \$? -eq 0 ]; then
+        echo "===================================" | tee /dev/kmsg
+        echo "Installation finished. Rebooting..." | tee /dev/kmsg
+        echo "===================================" | tee /dev/kmsg
+        echo
+        reboot -f
+else
+        echo "============================" | tee /dev/kmsg
+        echo "Failed to install Tumbleweed" | tee /dev/kmsg
+        echo "============================" | tee /dev/kmsg
+fi
+EOF
+
+sed -i -e "s@source_conf /etc/conf.d@&\nbash -x /scripts/install-tumbleweed.sh@" init
+
+# Make new initramfs
+find . | cpio -H newc -o | gzip -9 > $WDIR/dump-initramfs-v0
+
+#Make BFB
+cd ..
+
+boot_args=$(mktemp)
+boot_args2=$(mktemp)
+boot_path=$(mktemp)
+boot_desc=$(mktemp)
+printf "console=tty0 console=ttyAMA1,115200n8 console=hvc0 console=ttyAMA0,115200n8 earlycon=pl011,0x01000000 earlycon=pl011,0x01800000 initrd=initramfs ignore_loglevel rd.shell rd.break=mount earlyprintk" > "$boot_args"
+printf "console=hvc0 console=ttyAMA0,115200n8 earlycon=pl011,0x13010000 initrd=initramfs" > \
+	"$boot_args2"
+printf "VenHw(F019E406-8C9C-11E5-8797-001ACA00BFC4)/Image" > "$boot_path"
+printf "Linux from rshim" > "$boot_desc"
+kimage=$WDIR/kimage
+#cat /lib/modules/$kernel/Image > "$kimage"
+cat /boot/Image > "$kimage"
+
+mkbfb=`which mlx-mkbfb`
+
+$mkbfb \
+	--image "$kimage" \
+	--initramfs "$initramfs" \
+	--capsule "$CAPSULE" \
+	--boot-args-v0 "$boot_args" \
+	--boot-args-v2 "$boot_args2" \
+	--boot-path "$boot_path" \
+	--boot-desc "$boot_desc" \
+	${BFB} /workspace/${SLES_BFB}
+
+echo "BFB is ready: `readlink -f /workspace/${SLES_BFB}`"
